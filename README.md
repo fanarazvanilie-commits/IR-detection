@@ -1,4 +1,4 @@
-# ESP32-S3 Camera ROI and Blob Detection Documentation
+# ESP32-S3 Camera ROI and Blob Detection Documentation (OUTDATED STILL)
 
 ## Overview
 This ESP32-S3 project captures grayscale camera frames, extracts a ring-shaped Region Of Interest (ROI), and performs blob detection for bright IR-like signals.
