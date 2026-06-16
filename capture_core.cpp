@@ -12,6 +12,7 @@ namespace s3capture {
 
 static int roi_count = 0;
 static int roi_indices[MAX_ROI_PIXELS];
+static int roi_sections[MAX_ROI_PIXELS];
 
 unsigned long lastCaptureTime = 0;
 int imageCount = 1;
@@ -38,13 +39,29 @@ static float previousAveragesForCsv[ANGULAR_SECTIONS] = {0.0f};
 static bool hasPreviousAveragesForCsv = false;
 static float previousAveragesForDetection[ANGULAR_SECTIONS] = {0.0f};
 static bool hasPreviousAveragesForDetection = false;
+static uint8_t sectionStates[ANGULAR_SECTIONS] = {0};
 
-static const int MAX_SESSIONS = 3;
+static const int MAX_SESSIONS = 8;
 static const int SESSION_ZONE_MARGIN = 2;
 static const int SESSION_CAPTURE_MARGIN = 3;
-static const int SESSION_START_FRAMES = 1;
+static const int SESSION_START_FRAMES = 2;
 static const int SESSION_CAPTURE_FRAMES = 6;
 static const int SESSION_TIMEOUT_FRAMES = 8;
+static const int SESSION_MAX_LIFETIME_FRAMES = 8;
+static const int SESSION_START_SKIP_FRAMES = 1;
+
+// Allocation / validation tuning to reduce false positives
+static const float GAUSS_NORMERR_TIGHT = 0.06f; // strict threshold for very small blobs
+static const float GAUSS_NORMERR_LOOSE = 0.13f; // looser threshold for wider blobs
+static const float MIN_PEAK_FOR_ALLOC = 0.0f;   // minimum smoothed peak to consider allocating a session
+static const float GAUSS_PEAK_RATIO_MIN = 1.8f;  // require the center peak to stand out above the blob average
+static const float DETECTION_THRESHOLD_MIN = 0.6f;
+static const float DETECTION_THRESHOLD_SCALE = 0.45f;
+static const float SESSION_START_RISING_THRESHOLD_MIN = 5.0f;
+static const float SESSION_START_RISING_THRESHOLD_SCALE = 0.5f;
+static const int MIN_BLOB_SIZE_FOR_LOOSE = 3;   // blob size >= this may use loose normErr
+
+
 
 struct CaptureSession
 {
@@ -55,6 +72,9 @@ struct CaptureSession
   int captureDelay = 0;
   int captureFrames = 0;
   int lastActiveFrame = -1;
+  int allocatedFrame = -1;
+  int currentBit = 0;
+  int pendingTransitionCount = 0;
   uint8_t frameBits[SESSION_CAPTURE_FRAMES];
 };
 
@@ -126,22 +146,6 @@ static bool saveGrayscalePgm(camera_fb_t *fb, const char *path)
   return true;
 }
 
-static int getAngularSection(int x, int y)
-{
-  int dx = x - ROI_CENTER_X;
-  int dy = y - ROI_CENTER_Y;
-  float angle = atan2f(dy, dx) * 180.0f / PI;
-  if (angle < 0)
-  {
-    angle += 360.0f;
-  }
-  int section = (int)(angle / DEGREES_PER_SECTION);
-  if (section >= ANGULAR_SECTIONS)
-  {
-    section = ANGULAR_SECTIONS - 1;
-  }
-  return section;
-}
 //We loop over all pixels that belong to the ROI. roi_indices[] stores the positions (as 1D indices) of those pixels.
 static void computeAngularAverages(const uint8_t *img, float *averages, int numSections) {
   int counts[ANGULAR_SECTIONS] = {0};
@@ -149,60 +153,35 @@ static void computeAngularAverages(const uint8_t *img, float *averages, int numS
   for (int i = 0; i < roi_count; ++i)
   {
     int idx = roi_indices[i];
- // Convert 1D index into (x, y) coordinates
-    int x = idx % IMAGE_WIDTH;
-    int y = idx / IMAGE_WIDTH;
-
-    int section = getAngularSection(x, y); // Determine which angular section this pixel belongs to
+    int section = roi_sections[i];
     sums[section] += img[idx];
     counts[section]++;
   }
-  
-   //fallback no pixels in section
+
   for (int s = 0; s < numSections; ++s)
   {
-    if (counts[s] > 0){
-      averages[s] = sums[s] / counts[s];}
-    else{
-      averages[s] = 0.0f; }
+    if (counts[s] > 0)
+    {
+      averages[s] = sums[s] / counts[s];
+    }
+    else
+    {
+      averages[s] = 0.0f;
+    }
   }
 }
-// Subtract the previous frame's raw section averages from the current frame's raw section averages.
-// The peak section and its neighbors preserve their absolute intensity to anchor the signal
-// and prevent collapse to zero over time.
-static void computeBaselineSubtractedAverages(const float *averages, float *deltaSubtracted, float *absoluteSubtracted, int numSections, float *previousAverages, bool &hasPreviousAverages)
+// Subtract the previous frame's section averages from the current frame's section averages.
+// This removes static reflections and keeps only frame-to-frame intensity changes.
+static void computeBaselineSubtractedAverages(const float *averages, float *deltaSubtracted, 
+  int numSections, float *previousAverages, bool &hasPreviousAverages)
 {
-  float minValue = averages[0];
-  int peakSection = 0;
-  float peakValue = averages[0];
-  
-  for (int s = 1; s < numSections; ++s)
-  {
-    if (averages[s] < minValue)
-    {
-      minValue = averages[s];
-    }
-    if (averages[s] > peakValue)
-    {
-      peakValue = averages[s];
-      peakSection = s;
-    }
-  }
-
-  for (int s = 0; s < numSections; ++s)
-  {
-    if (absoluteSubtracted)
-    {
-      absoluteSubtracted[s] = averages[s] - minValue;
-    }
-  }
-
   if (!hasPreviousAverages)
   {
     for (int s = 0; s < numSections; ++s)
     {
       deltaSubtracted[s] = 0.0f;
     }
+
     memcpy(previousAverages, averages, sizeof(float) * numSections);
     hasPreviousAverages = true;
     return;
@@ -210,21 +189,8 @@ static void computeBaselineSubtractedAverages(const float *averages, float *delt
 
   for (int s = 0; s < numSections; ++s)
   {
-    int diff = abs(s - peakSection);
-    if (diff > numSections - diff)
-    {
-      diff = numSections - diff;
-    }
-    
-    if (diff <= 2)
-    {
-      deltaSubtracted[s] = averages[s];
-    }
-    else
-    {
-      deltaSubtracted[s] = averages[s] - previousAverages[s];
-      previousAverages[s] = averages[s];
-    }
+    deltaSubtracted[s] = averages[s] - previousAverages[s];
+    previousAverages[s] = averages[s];
   }
 }
 static void makeSdFilename(char *filename, size_t size, bool active, time_t timestamp, int index, const char *extension = ".pgm")
@@ -332,14 +298,14 @@ static size_t makeSectionAveragesCsv(const float *averages, int numSections, cha
   return offset;
 }
 
+
 static size_t makeSectionDeltaCsv(const float *deltas, int numSections, char *buffer, size_t bufferSize)
 {
   size_t offset = 0;
   for (int s = 0; s < numSections; ++s)
   {
     int angle = static_cast<int>(s * DEGREES_PER_SECTION);
-    float outputValue = deltas[s] > 0.0f ? deltas[s] : 0.0f;
-    int written = snprintf(buffer + offset, bufferSize - offset, "%ddeg,%.2f\n", angle, outputValue);
+    int written = snprintf(buffer + offset, bufferSize - offset, "%ddeg,%.2f\n", angle, deltas[s]);
     if (written < 0 || static_cast<size_t>(written) >= bufferSize - offset)
     {
       break;
@@ -350,6 +316,7 @@ static size_t makeSectionDeltaCsv(const float *deltas, int numSections, char *bu
 }
 
 static bool initSdBatchBuffer()
+
 {
   if (sdBatchBuffer && sdCsvBatchBuffer)
   {
@@ -514,20 +481,19 @@ static char csvTemp[SD_CSV_BUFFER_SIZE];
 void saveToSD(camera_fb_t *fb)
 {
   bool active = isSessionActive();
-  unsigned long now = millis();
-  if (!active && (now - lastCaptureTime) < SD_IDLE_SAVE_INTERVAL_MS)
+  if (!active && (millis() - lastCaptureTime) < SD_IDLE_SAVE_INTERVAL_MS)
   {
     return;
   }
 
   float angularAverages[ANGULAR_SECTIONS] = {0.0f};
   float deltaSubtracted[ANGULAR_SECTIONS] = {0.0f};
+  float smoothed[ANGULAR_SECTIONS] = {0.0f};
 
   if (roi_count > 0)
   {
-    float absoluteSubtracted[ANGULAR_SECTIONS] = {0.0f};
     computeAngularAverages(fb->buf, angularAverages, ANGULAR_SECTIONS);
-    computeBaselineSubtractedAverages(angularAverages, deltaSubtracted, absoluteSubtracted, ANGULAR_SECTIONS, previousAveragesForCsv, hasPreviousAveragesForCsv);
+    computeBaselineSubtractedAverages(angularAverages, deltaSubtracted, ANGULAR_SECTIONS, previousAveragesForCsv, hasPreviousAveragesForCsv);
   }
 
   size_t csvLen = makeSectionDeltaCsv(deltaSubtracted, ANGULAR_SECTIONS, csvTemp, SD_CSV_BUFFER_SIZE);
@@ -549,7 +515,7 @@ void saveToSD(camera_fb_t *fb)
     if (saveGrayscalePgmBuffer(fb->buf, fb->len, fb->width, fb->height, imageFilename) &&
         saveCsvBuffer(csvTemp, csvLen, csvFilename))
     {
-      lastCaptureTime = now;
+      lastCaptureTime = millis();
       imageCount++;
       Serial.printf("SD saved %s and %s\n", imageFilename, csvFilename);
     }
@@ -560,7 +526,7 @@ void saveToSD(camera_fb_t *fb)
     return;
   }
 
-  lastCaptureTime = now;
+  lastCaptureTime = millis();
 }
 
 static int allocateSession(int section, int frameId)
@@ -576,6 +542,9 @@ static int allocateSession(int section, int frameId)
       sessions[i].captureDelay = 0;
       sessions[i].captureFrames = 0;
       sessions[i].lastActiveFrame = frameId;
+      sessions[i].allocatedFrame = frameId;
+      sessions[i].currentBit = 0;
+      sessions[i].pendingTransitionCount = 0;
       for (int j = 0; j < SESSION_CAPTURE_FRAMES; ++j)
       {
         sessions[i].frameBits[j] = 0;
@@ -599,6 +568,9 @@ static void resetSession(int index)
   sessions[index].captureDelay = 0;
   sessions[index].captureFrames = 0;
   sessions[index].lastActiveFrame = -1;
+  sessions[index].allocatedFrame = -1;
+  sessions[index].currentBit = 0;
+  sessions[index].pendingTransitionCount = 0;
   for (int j = 0; j < SESSION_CAPTURE_FRAMES; ++j)
   {
     sessions[index].frameBits[j] = 0;
@@ -695,60 +667,232 @@ static void analyzeROI(const uint8_t *img, uint32_t &sum, uint8_t &minVal, uint8
   pixelCount = roi_count;
 }
 
-static bool findBrightestPixelInROI(const uint8_t *img, uint8_t &outIntensity, int &outIndex, int &outX, int &outY)
+
+
+
+static void updateSectionStates(const float *deltas, int numSections, uint8_t *states, float threshold)
 {
-  for (int i = 0; i < roi_count; ++i)
-  {
-    int idx = roi_indices[i];
-    uint8_t px = img[idx];
-    if (px >= BLOB_MIN_INTENSITY && px > outIntensity){
-      outIntensity = px;
-      outIndex = idx;
-      outX = idx % IMAGE_WIDTH;
-      outY = idx / IMAGE_WIDTH; }
-  }
-
-  return outIndex >= 0;
-}
-
-
-
-
-
-static void smoothAngularSignal(const float *src, float *dst, int numSections, float sigma)
-{
-  int radius = maxInt(1, (int)(sigma * 3.0f));
-  int kernelSize = 2 * radius + 1;
-  float kernel[25];
-  float norm = 0.0f;
-
-  for (int i = 0; i < kernelSize; ++i)
-  {
-    float x = (float)(i - radius);
-    float w = expf(-0.5f * (x * x) / (sigma * sigma));
-    kernel[i] = w;
-    norm += w;
-  }
-
   for (int s = 0; s < numSections; ++s)
   {
-    float sum = 0.0f;
-    for (int i = 0; i < kernelSize; ++i)
+    if (fabsf(deltas[s]) > threshold)
     {
-      int idx = (s + i - radius + numSections) % numSections;
-      sum += kernel[i] * src[idx];
+      states[s] = 1;
     }
-    dst[s] = sum / norm;
+    else
+    {
+      states[s] = 0;
+    }
   }
 }
 
-static void combineAngularSignals(const float *deltaSubtracted, const float *absoluteSubtracted, float *combined, int numSections)
+static int computeBlobCenter(int start, int end, int numSections)
 {
+  if (start <= end)
+  {
+    return (start + end) / 2;
+  }
+
+  int wrappedLength = (numSections - start) + (end + 1);
+  int centerOffset = wrappedLength / 2;
+  int center = start + centerOffset;
+  if (center >= numSections)
+  {
+    center -= numSections;
+  }
+  return center;
+}
+
+static int findSignificantSectionBlobs(const float *deltas, int numSections, float threshold, int *blobStarts, int *blobEnds, int maxBlobs)
+{
+  bool active[ANGULAR_SECTIONS];
   for (int s = 0; s < numSections; ++s)
   {
-    float delta = deltaSubtracted[s];
-    combined[s] = delta + ANGULAR_PEAK_ABSOLUTE_WEIGHT * absoluteSubtracted[s];
+    active[s] = fabsf(deltas[s]) > threshold;
   }
+
+  int blobCount = 0;
+  int start = -1;
+
+  for (int s = 0; s < numSections; ++s)
+  {
+    if (active[s])
+    {
+      if (start < 0)
+      {
+        start = s;
+      }
+    }
+    else if (start >= 0)
+    {
+      if (blobCount < maxBlobs)
+      {
+        blobStarts[blobCount] = start;
+        blobEnds[blobCount] = s - 1;
+      }
+      blobCount++;
+      start = -1;
+    }
+  }
+
+  if (start >= 0)
+  {
+    if (blobCount < maxBlobs)
+    {
+      blobStarts[blobCount] = start;
+      blobEnds[blobCount] = numSections - 1;
+    }
+    blobCount++;
+  }
+
+  if (blobCount > 1 && active[0] && active[numSections - 1])
+  {
+    int lastIndex = blobCount - 1;
+    int firstStart = blobStarts[0];
+    int firstEnd = blobEnds[0];
+    int lastStart = blobStarts[lastIndex];
+    int lastEnd = blobEnds[lastIndex];
+
+    if (blobCount <= maxBlobs)
+    {
+      blobStarts[0] = lastStart;
+      blobEnds[0] = firstEnd;
+      for (int i = 1; i < lastIndex; ++i)
+      {
+        blobStarts[i] = blobStarts[i + 1];
+        blobEnds[i] = blobEnds[i + 1];
+      }
+    }
+
+    blobCount--;
+  }
+
+  return blobCount > maxBlobs ? maxBlobs : blobCount;
+}
+
+static bool validateBlobWithGaussianFit(const float *deltas, int start, int end, int numSections, int center)
+{
+  // Extract blob values and find peak
+  float blobValues[ANGULAR_SECTIONS];
+  int blobSize = 0;
+  float peakValue = 0.0f;
+
+  float signedPeak = 0.0f;
+  float signalSum = 0.0f;
+  float weightedAngleSum = 0.0f;
+  float weightSum = 0.0f;
+
+  if (start <= end)
+  {
+    for (int s = start; s <= end; ++s)
+    {
+      float value = deltas[s];
+      blobValues[blobSize] = value;
+      float absValue = fabsf(value);
+      if (absValue > signedPeak)
+      {
+        signedPeak = absValue;
+      }
+      float angle = s * DEGREES_PER_SECTION;
+      weightedAngleSum += angle * absValue;
+      weightSum += absValue;
+      blobSize++;
+    }
+  }
+  else
+  {
+    for (int s = start; s < numSections; ++s)
+    {
+      float value = deltas[s];
+      blobValues[blobSize] = value;
+      float absValue = fabsf(value);
+      if (absValue > signedPeak)
+      {
+        signedPeak = absValue;
+      }
+      float angle = s * DEGREES_PER_SECTION;
+      weightedAngleSum += angle * absValue;
+      weightSum += absValue;
+      blobSize++;
+    }
+    for (int s = 0; s <= end; ++s)
+    {
+      float value = deltas[s];
+      blobValues[blobSize] = value;
+      float absValue = fabsf(value);
+      if (absValue > signedPeak)
+      {
+        signedPeak = absValue;
+      }
+      float angle = s * DEGREES_PER_SECTION;
+      weightedAngleSum += angle * absValue;
+      weightSum += absValue;
+      blobSize++;
+    }
+  }
+
+  if (signedPeak <= 0.0f)
+  {
+    return false;
+  }
+
+  float averageAbs = (blobSize > 0) ? (signalSum / blobSize) : 0.0f;
+  if (blobSize > 1 && signedPeak < averageAbs * GAUSS_PEAK_RATIO_MIN)
+  {
+    return false;
+  }
+
+  float centerAngle;
+  if (weightSum > 0.0f)
+  {
+    centerAngle = fmodf(weightedAngleSum / weightSum, 360.0f);
+    if (centerAngle < 0.0f)
+    {
+      centerAngle += 360.0f;
+    }
+  }
+  else
+  {
+    centerAngle = center * DEGREES_PER_SECTION;
+  }
+
+  float amplitude = signedPeak;
+  float variance = 0.0f;
+  int centerIndexInBlob = (start <= end) ? (center - start) : ((center >= start) ? (center - start) : (numSections - start + center));
+
+  for (int i = 0; i < blobSize; ++i)
+  {
+    float dx = i - centerIndexInBlob;
+    variance += fabsf(blobValues[i]) * dx * dx;
+  }
+  variance /= (weightSum > 0.0f ? weightSum : 1.0f);
+  float sigma = sqrtf(variance);
+  if (sigma < 0.5f)
+  {
+    sigma = 0.5f;
+  }
+
+  float sumSquaredError = 0.0f;
+  for (int i = 0; i < blobSize; ++i)
+  {
+    float dx = i - centerIndexInBlob;
+    float fitted = amplitude * expf(-(dx * dx) / (2.0f * sigma * sigma));
+    float error = fabsf(blobValues[i]) - fitted;
+    sumSquaredError += error * error;
+  }
+
+  float normalizedError = sumSquaredError / (blobSize * amplitude * amplitude);
+  Serial.printf("[GAUSS] blob start=%d end=%d size=%d peak=%.2f normErr=%.3f center=%d sigma=%.2f\n", start, end, blobSize, amplitude, normalizedError, center, sigma);
+
+  if (amplitude < MIN_PEAK_FOR_ALLOC)
+  {
+    return false;
+  }
+
+  if (blobSize < MIN_BLOB_SIZE_FOR_LOOSE)
+  {
+    return normalizedError < GAUSS_NORMERR_TIGHT;
+  }
+  return normalizedError < GAUSS_NORMERR_LOOSE;
 }
 
 static bool isSectionInWindow(int section, int center, int margin, int numSections)
@@ -761,95 +905,10 @@ static bool isSectionInWindow(int section, int center, int margin, int numSectio
   return diff <= margin;
 }
 
-static int findAngularPeaks(const float *subtracted, int numSections, int *peakSections, int maxPeaks)
-{
-  int peaks = 0;
-  for (int s = 0; s < numSections; ++s){
-    float value = subtracted[s];
-    if (value < ANGULAR_PEAK_THRESHOLD){    // Ignore small values (below threshold)
-    continue; }
 
 
-   /*Check if this point is a LOCAL MAXIMUM.
-    A local maximum means:- This value is bigger than its neighbors
-    - Not just immediate neighbors, but also within ANGULAR_PEAK_MIN_DISTANCE distance
-    */
-    bool isLocalMax = true;
-    for (int d = 1; d <= ANGULAR_PEAK_MIN_DISTANCE; ++d)
-    {
-      int left = (s - d + numSections) % numSections;
-      int right = (s + d) % numSections;
-      if (value <= subtracted[left] || value <= subtracted[right]){
-        isLocalMax = false;
-        break; }
-    }
 
-    if (!isLocalMax){ // skip if not lcaol maximum
-      continue; }
-
-    if (peaks < maxPeaks){
-      peakSections[peaks++] = s; }
-  }
-
-  return peaks;
-}
-
-static int countEdgePixels(const uint8_t *img, int brightX, int brightY, uint8_t &outMaxEdgeIntensity, int &outEdgeSumX, int &outEdgeSumY)
-{
-  int edgePixels = 0;
-  const int searchRadiusSquared = BLOB_SEARCH_RADIUS * BLOB_SEARCH_RADIUS;
-
-  for (int i = 0; i < roi_count; ++i)
-  {
-    int idx = roi_indices[i];
-    int x = idx % IMAGE_WIDTH;
-    int y = idx / IMAGE_WIDTH;
-    uint8_t px = img[idx];
-
-    if (px < BLOB_MIN_INTENSITY)
-    {
-      continue;
-    }
-
-    int dx = x - brightX;
-    int dy = y - brightY;
-    if ((dx * dx + dy * dy) > searchRadiusSquared)
-    {
-      continue;
-    }
-
-    bool hasIntensityJump = false;
-    for (int o = 0; o < 4; ++o)
-    {
-      int nx = x + kNeighborOffsets[o][0];
-      int ny = y + kNeighborOffsets[o][1];
-      if (nx < 0 || nx >= IMAGE_WIDTH || ny < 0 || ny >= IMAGE_HEIGHT)
-      {
-        continue;
-      }
-
-      int neighborIndex = toIndex(nx, ny);
-      uint8_t neighborPx = img[neighborIndex];
-      if ((px - neighborPx) >= BLOB_NEIGHBOR_DIFF)
-      {
-        hasIntensityJump = true;
-        break;
-      }
-    }
-
-    if (hasIntensityJump)
-    {
-      ++edgePixels;
-      outEdgeSumX += x;
-      outEdgeSumY += y;
-      outMaxEdgeIntensity = (uint8_t)maxInt(outMaxEdgeIntensity, px);
-    }
-  }
-
-  return edgePixels;
-}
-
-static void logFrame(int frameId, float mean, uint8_t minVal, uint8_t maxVal, int edgePixels, bool blobDetected, int blobCenterX, int blobCenterY, uint8_t maxEdgeIntensity, int angularPeaks, const int *peakSections, float blobAngle)
+static void logFrame(int frameId, float mean, uint8_t minVal, uint8_t maxVal, int activeStateCount)
 {
   Serial.print("[FRAME ");
   Serial.print(frameId);
@@ -859,43 +918,13 @@ static void logFrame(int frameId, float mean, uint8_t minVal, uint8_t maxVal, in
   Serial.print(minVal);
   Serial.print(" max=");
   Serial.print(maxVal);
-  Serial.print(" edge_px=");
-  Serial.print(edgePixels);
-
-  if (blobDetected)
-  {
-    Serial.print(" center=(");
-    Serial.print(blobCenterX);
-    Serial.print(",");
-    Serial.print(blobCenterY);
-    Serial.print(") int=");
-    Serial.print(maxEdgeIntensity);
-    Serial.print(" angle=");
-    Serial.print(blobAngle, 1);
-    Serial.print(" section=");
-    Serial.print((int)(blobAngle / DEGREES_PER_SECTION));
-  }
-
-  Serial.print(" angular_peaks=");
-  Serial.print(angularPeaks);
-
-  if (angularPeaks > 0)
-  {
-    Serial.print(" peak_sections=");
-    for (int i = 0; i < angularPeaks; ++i)
-    {
-      Serial.print(peakSections[i]);
-      if (i < angularPeaks - 1)
-      {
-        Serial.print(",");
-      }
-    }
-  }
-
+  Serial.print(" activeStates=");
+  Serial.print(activeStateCount);
   Serial.println();
 }
 
 void setupSerial()
+
 {
   Serial.begin(SERIAL_BAUD_RATE);
   Serial.setDebugOutput(true);
@@ -1000,7 +1029,19 @@ void buildROI()
 
       if (roi_count < static_cast<int>(MAX_ROI_PIXELS))
       {
-        roi_indices[roi_count++] = toIndex(x, y);
+        roi_indices[roi_count] = toIndex(x, y);
+        float angle = atan2f(dy, dx) * 180.0f / PI;
+        if (angle < 0)
+        {
+          angle += 360.0f;
+        }
+        int section = static_cast<int>(angle / DEGREES_PER_SECTION);
+        if (section >= ANGULAR_SECTIONS)
+        {
+          section = ANGULAR_SECTIONS - 1;
+        }
+        roi_sections[roi_count] = section;
+        roi_count++;
       }
     }
   }
@@ -1035,28 +1076,7 @@ void buildROI()
   Serial.println("]");
 }
 
-void splitROIAngularSections(int *pixelSections)
-{
-  for (int i = 0; i < roi_count; ++i)
-  {
-    int idx = roi_indices[i];
-    int x = idx % IMAGE_WIDTH;
-    int y = idx / IMAGE_WIDTH;
-    int dx = x - ROI_CENTER_X;
-    int dy = y - ROI_CENTER_Y;
-    float angle = atan2f(dy, dx) * 180.0f / PI;
-    if (angle < 0)
-    {
-      angle += 360.0f;
-    }
-    int section = (int)(angle / DEGREES_PER_SECTION);
-    if (section >= ANGULAR_SECTIONS)
-    {
-      section = ANGULAR_SECTIONS - 1;
-    }
-    pixelSections[i] = section;
-  }
-}
+
 
 
 
@@ -1083,82 +1103,88 @@ void processFrame(camera_fb_t *fb, int frameId)
     mean = ((float)sum) / pixelCount;
   }
 
-  uint8_t brightIntensity = 0;
-  int brightIndex = -1;
-  int brightX = -1;
-  int brightY = -1;
-  if (roi_count > 0)
-  {
-    findBrightestPixelInROI(img, brightIntensity, brightIndex, brightX, brightY);
-  }
-
-  int edgePixels = 0;
-  int edgeSumX = 0;
-  int edgeSumY = 0;
-  uint8_t maxEdgeIntensity = 0;
-  if (brightIndex >= 0)
-  {
-    edgePixels = countEdgePixels(img, brightX, brightY, maxEdgeIntensity, edgeSumX, edgeSumY);
-  }
-  bool blobDetected = edgePixels >= BLOB_MIN_EDGE_PIXELS;
-  int blobCenterX = -1;
-  int blobCenterY = -1;
-  if (blobDetected)
-  {
-    blobCenterX = edgeSumX / edgePixels;
-    blobCenterY = edgeSumY / edgePixels;
-  }
-
-  float angularAverages[ANGULAR_SECTIONS];
-  float deltaSubtracted[ANGULAR_SECTIONS];
-  float absoluteSubtracted[ANGULAR_SECTIONS];
-  float combinedSignal[ANGULAR_SECTIONS];
-  float smoothedSignal[ANGULAR_SECTIONS];
-  int peakSections[MAX_ANGULAR_PEAKS];
-  int peakValues[MAX_ANGULAR_PEAKS];
-  int peakCount = 0;
-
+  float angularAverages[ANGULAR_SECTIONS] = {0.0f};
+  float deltaSubtracted[ANGULAR_SECTIONS] = {0.0f};
+  float smoothed[ANGULAR_SECTIONS] = {0.0f};
+  float detectionThreshold = ANGULAR_PEAK_THRESHOLD;
+  float maxDeltaSmoothed = 0.0f;
+  float sessionStartThreshold = SESSION_START_RISING_THRESHOLD_MIN;
   if (roi_count > 0)
   {
     computeAngularAverages(img, angularAverages, ANGULAR_SECTIONS);
-    computeBaselineSubtractedAverages(angularAverages, deltaSubtracted, absoluteSubtracted, ANGULAR_SECTIONS, previousAveragesForDetection, hasPreviousAveragesForDetection);
-    combineAngularSignals(deltaSubtracted, absoluteSubtracted, combinedSignal, ANGULAR_SECTIONS);
-    smoothAngularSignal(combinedSignal, smoothedSignal, ANGULAR_SECTIONS, ANGULAR_PEAK_SIGMA);
-    peakCount = findAngularPeaks(smoothedSignal, ANGULAR_SECTIONS, peakSections, MAX_ANGULAR_PEAKS);
-    if (peakCount == 0)
+    computeBaselineSubtractedAverages(
+      angularAverages,
+      deltaSubtracted,
+      ANGULAR_SECTIONS,
+      previousAveragesForDetection,
+      hasPreviousAveragesForDetection);
+
+    // Small circular 3-point smoothing to reduce jagged noise while keeping peaks thin
+    for (int s = 0; s < ANGULAR_SECTIONS; ++s)
     {
-      peakCount = findAngularPeaks(combinedSignal, ANGULAR_SECTIONS, peakSections, MAX_ANGULAR_PEAKS);
+      int left = (s - 1 + ANGULAR_SECTIONS) % ANGULAR_SECTIONS;
+      int right = (s + 1) % ANGULAR_SECTIONS;
+      smoothed[s] = (deltaSubtracted[left] + 2.0f * deltaSubtracted[s] + deltaSubtracted[right]) * 0.25f;
     }
-    for (int i = 0; i < peakCount; ++i)
+
+    float maxDeltaRaw = 0.0f;
+    float absDeltaSum = 0.0f;
+    int positiveSections = 0;
+    for (int s = 0; s < ANGULAR_SECTIONS; ++s)
     {
-      float deltaValue = deltaSubtracted[peakSections[i]];
-      if (deltaValue > 0.0f)
+      if (deltaSubtracted[s] > maxDeltaRaw) maxDeltaRaw = deltaSubtracted[s];
+      if (smoothed[s] > maxDeltaSmoothed) maxDeltaSmoothed = smoothed[s];
+      absDeltaSum += fabsf(smoothed[s]);
+      if (smoothed[s] > DETECTION_THRESHOLD_MIN) positiveSections++;
+    }
+
+    detectionThreshold = max(DETECTION_THRESHOLD_MIN, maxDeltaSmoothed * DETECTION_THRESHOLD_SCALE);
+    if (detectionThreshold < ANGULAR_PEAK_THRESHOLD)
+    {
+      detectionThreshold = ANGULAR_PEAK_THRESHOLD;
+    }
+
+    sessionStartThreshold = (maxDeltaSmoothed < SESSION_START_RISING_THRESHOLD_MIN)
+        ? max(detectionThreshold * 2.0f, maxDeltaSmoothed * SESSION_START_RISING_THRESHOLD_SCALE)
+        : SESSION_START_RISING_THRESHOLD_MIN;
+
+    updateSectionStates(smoothed, ANGULAR_SECTIONS, sectionStates, detectionThreshold);
+
+    int blobStarts[ANGULAR_SECTIONS];
+    int blobEnds[ANGULAR_SECTIONS];
+    int blobCount = findSignificantSectionBlobs(smoothed, ANGULAR_SECTIONS, detectionThreshold, blobStarts, blobEnds, ANGULAR_SECTIONS);
+
+    Serial.printf("[DEBUG] frame %d maxRaw=%.2f maxSm=%.2f threshold=%.2f blobs=%d positiveSections=%d\n",
+                  frameId, maxDeltaRaw, maxDeltaSmoothed, detectionThreshold, blobCount, positiveSections);
+
+    if (blobCount > 0)
+    {
+      for (int b = 0; b < blobCount; ++b)
       {
-        peakValues[i] = 1;
-      }
-      else if (deltaValue < 0.0f)
-      {
-        peakValues[i] = 0;
-      }
-      else
-      {
-        peakValues[i] = absoluteSubtracted[peakSections[i]] > ANGULAR_PEAK_THRESHOLD ? 1 : 0;
+        int centerSection = computeBlobCenter(blobStarts[b], blobEnds[b], ANGULAR_SECTIONS);
+        if (findSessionForSection(centerSection) >= 0)
+        {
+          continue;
+        }
+
+        float centerValue = smoothed[centerSection];
+        float centerPeak = fabsf(centerValue);
+        if (centerValue <= sessionStartThreshold)
+        {
+          continue;
+        }
+        if (centerPeak < detectionThreshold || centerPeak < MIN_PEAK_FOR_ALLOC)
+        {
+          continue;
+        }
+
+        if (validateBlobWithGaussianFit(smoothed, blobStarts[b], blobEnds[b], ANGULAR_SECTIONS, centerSection))
+        {
+          allocateSession(centerSection, frameId);
+        }
       }
     }
   }
-
-  float blobAngle = -1.0f;
-  if (blobDetected)
-  {
-    blobAngle = atan2f(blobCenterY - ROI_CENTER_Y, blobCenterX - ROI_CENTER_X) * 180.0f / PI;
-    if (blobAngle < 0)
-    {
-      blobAngle += 360.0f;
-    }
-  }
-
-  unsigned long now = millis();
-  bool peakHandled[MAX_ANGULAR_PEAKS] = {false};
 
   for (int s = 0; s < MAX_SESSIONS; ++s)
   {
@@ -1167,24 +1193,16 @@ void processFrame(camera_fb_t *fb, int frameId)
       continue;
     }
 
-    bool areaSignal = false;
-    int overlapMargin = sessions[s].waitingForData ? SESSION_CAPTURE_MARGIN : SESSION_ZONE_MARGIN;
-    int signalBitValue = 0;
-    for (int i = 0; i < peakCount; ++i)
+    int centerSection = sessions[s].centerSection;
+    if (centerSection < 0 || centerSection >= ANGULAR_SECTIONS)
     {
-      if (peakHandled[i])
-      {
-        continue;
-      }
-      if (sectionsOverlap(peakSections[i], sessions[s].centerSection, overlapMargin))
-      {
-        areaSignal = true;
-        signalBitValue = peakValues[i];
-        sessions[s].centerSection = peakSections[i];
-        peakHandled[i] = true;
-        break;
-      }
+      resetSession(s);
+      continue;
     }
+
+    float centerDelta = smoothed[centerSection];
+    int signalBitValue = (fabsf(centerDelta) > detectionThreshold) ? 1 : 0;
+    const float bitDetectThreshold = max(DETECTION_THRESHOLD_MIN, maxDeltaSmoothed * 0.25f);
 
     if (sessions[s].waitingForData)
     {
@@ -1194,20 +1212,51 @@ void processFrame(camera_fb_t *fb, int frameId)
       }
       else if (sessions[s].captureFrames < SESSION_CAPTURE_FRAMES)
       {
+        if (fabsf(centerDelta) > bitDetectThreshold)
+        {
+          int detectedBit = (centerDelta > 0.0f) ? 1 : 0;
+          const float strongTransitionThreshold = max(bitDetectThreshold * 3.0f, SESSION_START_RISING_THRESHOLD_MIN);
+          if (detectedBit != sessions[s].currentBit)
+          {
+            if (fabsf(centerDelta) >= strongTransitionThreshold)
+            {
+              sessions[s].currentBit = detectedBit;
+              sessions[s].pendingTransitionCount = 0;
+            }
+            else
+            {
+              sessions[s].pendingTransitionCount++;
+              if (sessions[s].pendingTransitionCount >= 2)
+              {
+                sessions[s].currentBit = detectedBit;
+                sessions[s].pendingTransitionCount = 0;
+              }
+            }
+          }
+          else
+          {
+            sessions[s].pendingTransitionCount = 0;
+          }
+        }
+
+        int captureBitValue = sessions[s].currentBit;
         int bitIndex = sessions[s].captureFrames;
-        int bitValue = areaSignal ? signalBitValue : 0;
-        sessions[s].frameBits[bitIndex] = bitValue;
-        Serial.printf("[RX] session %d capture frame %d/%d id=%d areaSignal=%d bit=%d peakCount=%d center=%d bits=", s, bitIndex + 1, SESSION_CAPTURE_FRAMES, frameId, areaSignal ? 1 : 0, bitValue, peakCount, sessions[s].centerSection);
+        sessions[s].frameBits[bitIndex] = captureBitValue;
+        Serial.printf("[RX] session %d capture frame %d/%d bit=%d(captured) state=%d center=%d delta=%.2f bits=",
+                      s,
+                      bitIndex + 1,
+                      SESSION_CAPTURE_FRAMES,
+                      captureBitValue,
+                      signalBitValue,
+                      centerSection,
+                      centerDelta);
+
         for (int j = 0; j <= bitIndex; ++j)
         {
           Serial.print(sessions[s].frameBits[j]);
         }
         Serial.println();
         sessions[s].captureFrames++;
-      }
-
-      if (areaSignal)
-      {
         sessions[s].lastActiveFrame = frameId;
       }
 
@@ -1221,10 +1270,18 @@ void processFrame(camera_fb_t *fb, int frameId)
       {
         resetSession(s);
       }
+      else if ((frameId - sessions[s].allocatedFrame) > SESSION_MAX_LIFETIME_FRAMES)
+      {
+        Serial.print("[RX] session ");
+        Serial.print(s);
+        Serial.println(" exceeded max lifetime, resetting");
+        resetSession(s);
+      }
     }
     else
     {
-      if (areaSignal)
+      bool startSignal = centerDelta > sessionStartThreshold;
+      if (startSignal)
       {
         sessions[s].startFrames++;
         sessions[s].lastActiveFrame = frameId;
@@ -1232,53 +1289,45 @@ void processFrame(camera_fb_t *fb, int frameId)
         if (sessions[s].startFrames >= SESSION_START_FRAMES)
         {
           sessions[s].waitingForData = true;
-          sessions[s].captureDelay = 0; // skip this locking frame and start capture on the next one
+          sessions[s].captureDelay = SESSION_START_SKIP_FRAMES;
           sessions[s].captureFrames = 0;
+          sessions[s].currentBit = 1;
+          sessions[s].pendingTransitionCount = 0;
           Serial.print("[RX] LOCK session ");
           Serial.print(s);
-          Serial.print(" area section ");
+          Serial.print(" section ");
           Serial.print(sessions[s].centerSection);
-          Serial.println(" and start capture");
+          Serial.println(" start capture");
         }
       }
-      else if ((frameId - sessions[s].lastActiveFrame) > SESSION_TIMEOUT_FRAMES)
+      else
       {
+        sessions[s].startFrames = 0;
+      }
+
+      if ((frameId - sessions[s].lastActiveFrame) > SESSION_TIMEOUT_FRAMES)
+      {
+        resetSession(s);
+      }
+      else if ((frameId - sessions[s].allocatedFrame) > SESSION_MAX_LIFETIME_FRAMES)
+      {
+        Serial.print("[RX] session ");
+        Serial.print(s);
+        Serial.println(" exceeded max lifetime in startup, resetting");
         resetSession(s);
       }
     }
   }
 
-  for (int i = 0; i < peakCount; ++i)
-  {
-    if (peakHandled[i])
-    {
-      continue;
-    }
-
-    bool overlaps = false;
-    for (int s = 0; s < MAX_SESSIONS; ++s)
-    {
-      if (!sessions[s].active)
-      {
-        continue;
-      }
-      int overlapMargin = sessions[s].waitingForData ? SESSION_CAPTURE_MARGIN : SESSION_ZONE_MARGIN;
-      if (sectionsOverlap(peakSections[i], sessions[s].centerSection, overlapMargin))
-      {
-        overlaps = true;
-        break;
-      }
-    }
-
-    if (!overlaps)
-    {
-      allocateSession(peakSections[i], frameId);
-    }
-  }
   if ((frameId % PRINT_EVERY_FRAME) == 0)
   {
-    logFrame(frameId, mean, minVal, maxVal, edgePixels, blobDetected, blobCenterX, blobCenterY, maxEdgeIntensity, peakCount, peakSections, blobAngle);
+    int activeStateCount = 0;
+    for (int s = 0; s < ANGULAR_SECTIONS; ++s)
+    {
+      activeStateCount += (sectionStates[s] != 0) ? 1 : 0;
+    }
+    logFrame(frameId, mean, minVal, maxVal, activeStateCount);
   }
 }
 
-} 
+}
